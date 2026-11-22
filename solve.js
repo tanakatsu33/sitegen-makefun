@@ -30,7 +30,6 @@ const FM_TAG = /^[^"[\]]+$/;
 const FM_BLANK = /^[ \t]*$/;
 
 const FENCE_OPEN = /^```([A-Za-z0-9_+-]*)[ \t]*$/;
-const FENCE_CLOSE = /^```[ \t]*$/;
 const HEADING = /^(#{1,6})[ \t]+(.*?)[ \t]*$/;
 const HR = /^(?:---|\*\*\*)[ \t]*$/;
 const BULLET = /^[-*] (.*)$/;
@@ -43,11 +42,11 @@ const WS = /\s/;
 const ESC_RE = /[&<>"']/g;
 const ESC_TEST = /[&<>"']/;
 const WORD_RE = /\S+/g;
-const WORDS16_RE = /\S+(?:\s+\S+){15}/g;
+const WORDS16_RE = /\s*\S+(?:\s+\S+){15}/y;
 /** A newline before a line that may end a paragraph (blank, fence, heading or thematic break), or before the end. */
 const PARA_END_RE = /\n(?=[ \t\n`#*-]|$)/g;
-/** A line of a paragraph that opens or ends on a space or tab (so needs trimming). */
-const NEEDS_TRIM_RE = /(?:^|\n)[ \t]|[ \t](?:\n|$)/;
+/** Inside a paragraph, a line that opens or ends on a space or tab (so needs trimming). */
+const NEEDS_TRIM_RE = /[ \t]\n|\n[ \t]/;
 /** A closing fence line, from the newline before it. */
 const FENCE_CLOSE_NL_RE = /\n```[ \t]*(?=\n|$)/g;
 const SPECIAL_RE = /[\\`*[]/g;
@@ -148,9 +147,9 @@ function longDate(date) {
 }
 
 /**
- * Words: runs of non-\s characters, counted natively 16 at a time. A match of WORDS16_RE can only start at a word's
- * start (were 16 words to follow some later start, they would follow this one too) and spans exactly 16 words, so
- * the matches tile the words from the left; the fewer than 16 left are counted one by one.
+ * Words: runs of non-\s characters, counted natively 16 at a time. WORDS16_RE is sticky: from 0 or a word's end it
+ * takes the whitespace before and then exactly 16 whole words (each \S+ must run up to whitespace or the end, since
+ * \s+ follows it), so its matches tile the words from the left; the fewer than 16 left are counted one by one.
  */
 function countWords(s) {
   let w = 0;
@@ -573,7 +572,9 @@ function renderMarkdown(src, link, slugify) {
     }
     ls = pEnd + 1;
     let text = src.slice(pStart, pEnd);
-    if (NEEDS_TRIM_RE.test(text)) text = text.split('\n').map(trimLine).join('\n');
+    const c0 = text.charCodeAt(0);
+    const c1 = text.charCodeAt(text.length - 1);
+    if (c0 === 32 || c0 === 9 || c1 === 32 || c1 === 9 || NEEDS_TRIM_RE.test(text)) text = text.split('\n').map(trimLine).join('\n');
     const ih = inline(text, link);
     if (excerpt === null) excerpt = ih;
     html += '<p>' + ih + '</p>\n';
@@ -937,7 +938,6 @@ export function run(input) {
     } else statics.push({ path: f.path, content: f.content });
   }
 
-  const PH = globalThis.__ph; const PT = () => { if (PH) { const u = process.cpuUsage(); PH.push((u.user + u.system) / 1000); } }; PT();
   // front matter
   const kept = [];
   for (const s of sources) {
@@ -972,7 +972,6 @@ export function run(input) {
   }
   sources = kept;
 
-  PT();
   // permalinks
   const taken = new Map();
   const bySource = new Map();
@@ -990,7 +989,6 @@ export function run(input) {
     bySource.set(s.path, s);
   }
 
-  PT();
   // markdown
   const staticPaths = new Set();
   for (const f of statics) staticPaths.add(f.path);
@@ -1033,19 +1031,16 @@ export function run(input) {
       return h;
     };
     const body = s.text.slice(s.start);
-    const AB = globalThis.__ab ?? '';
-    const eb = AB.includes('noesc') ? body : esc(body);
-    const md = AB.includes('nomd') ? { html: '', toc: [], excerpt: '' } : renderMarkdown(eb, link, slugify);
-    s.html = flat(md.html);
+    const md = renderMarkdown(esc(body), link, slugify);
+    s.html = md.html;
     s.toc = md.toc;
-    s.excerpt = flat(md.excerpt);
+    s.excerpt = md.excerpt;
     s.date = s.data.date ?? '';
     s.dateLong = s.data.date === undefined ? '' : longDate(s.data.date);
-    s.minutes = AB.includes('nowc') ? 1 : Math.max(1, Math.ceil(countWords(body) / 200));
+    s.minutes = Math.max(1, Math.ceil(countWords(body) / 200));
     s.text = null;
   }
 
-  PT();
   // collections
   const posts = sources.filter((s) => s.post);
   posts.sort((x, y) => byCodeUnits(y.data.date, x.data.date) || byCodeUnits(x.slug, y.slug));
@@ -1094,7 +1089,6 @@ export function run(input) {
   }
   const tagList = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
-  PT();
   // layouts
   const cardOf = (s) => ({
     title: s.data.title,
@@ -1121,10 +1115,9 @@ export function run(input) {
   const tops = compileTemplates(templates, needs, { E: esc, T: textOf, B: truthy, g: step, F: flat, SITE: site, TAGS: allTags, RECENT: recent });
   const render = (name, kind, R) => {
     const f = tops.get(kind + '\u0000' + name);
-    return f === undefined ? null : f(R);
+    return f === undefined ? null : flat(f(R));
   };
 
-  PT();
   const output = {};
   for (const s of sources) {
     const page = cardOf(s);
@@ -1150,7 +1143,6 @@ export function run(input) {
     const html = render('tag', 'tag', { tag: { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => cards.get(p)) } });
     if (html !== null) output[`tags/${t.slug}/index.html`] = html;
   }
-  PT();
   const tagsHtml = render('tags', 'tags', {});
   if (tagsHtml !== null) output['tags/index.html'] = tagsHtml;
   for (const f of statics) {
@@ -1161,6 +1153,5 @@ export function run(input) {
   const lines = [...report, ...broken].sort(byCodeUnits);
   lines.push(`built ${sources.length - posts.length} pages, ${posts.length} posts, ${tagList.length} tags and ${statics.length} static files`);
   output['build-report.txt'] = `${lines.join('\n')}\n`;
-  PT();
   return output;
 }
