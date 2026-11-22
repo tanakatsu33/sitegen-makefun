@@ -1032,9 +1032,9 @@ export function run(input) {
     };
     const body = s.text.slice(s.start);
     const md = renderMarkdown(esc(body), link, slugify);
-    s.html = md.html;
+    s.html = flat(md.html);
     s.toc = md.toc;
-    s.excerpt = md.excerpt;
+    s.excerpt = flat(md.excerpt);
     s.date = s.data.date ?? '';
     s.dateLong = s.data.date === undefined ? '' : longDate(s.data.date);
     s.minutes = Math.max(1, Math.ceil(countWords(body) / 200));
