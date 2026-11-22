@@ -699,7 +699,65 @@ function step(v, k) {
 // dependencies are tracked: a unit that depends on nothing but the run's constant roots (site, tags, recent) is
 // rendered once per run; one that depends only on one outer loop element is memoized by that element.
 
+class TemplateCompileLimit extends Error {}
+
+// Compilation visits even unreachable branches, unlike the reference renderer. Fall back to its scope-chain
+// interpreter when expansion is too large or V8 cannot compile the generated function (e.g. deeply nested ifs).
 function compileTemplates(templates, needs, consts) {
+  try {
+    return compileTemplatesFast(templates, needs, consts);
+  } catch (err) {
+    if (!(err instanceof TemplateCompileLimit || err instanceof RangeError || err instanceof SyntaxError)) throw err;
+  }
+  const lookup = (scope, path) => {
+    while (scope !== null && !hasOwn(scope.vars, path[0])) scope = scope.parent;
+    if (scope === null) return undefined;
+    let v = scope.vars[path[0]];
+    for (let k = 1; k < path.length; k++) v = step(v, path[k]);
+    return v;
+  };
+  function render(nodes, scope, depth) {
+    let out = '';
+    for (const n of nodes) {
+      switch (n.kind) {
+        case 'text': out += n.text; break;
+        case 'var': out += esc(textOf(lookup(scope, n.path))); break;
+        case 'raw': out += textOf(lookup(scope, n.path)); break;
+        case 'if': {
+          const branch = truthy(lookup(scope, n.path)) !== n.not ? n.then : n.else;
+          if (branch !== null) out += render(branch, scope, depth);
+          break;
+        }
+        case 'for': {
+          const xs = lookup(scope, n.path);
+          if (!Array.isArray(xs)) break;
+          xs.forEach((x, k) => {
+            const vars = { [n.name]: x, loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length } };
+            out += render(n.body, { vars, parent: scope }, depth);
+          });
+          break;
+        }
+        case 'include': {
+          const t = templates.get(n.name);
+          if (t !== undefined && depth < INCLUDE_DEPTH) out += render(t, scope, depth + 1);
+          break;
+        }
+      }
+    }
+    return out;
+  }
+  const out = new Map();
+  for (const [name, kind] of needs) {
+    const nodes = templates.get(name);
+    if (nodes !== undefined) out.set(kind + '\u0000' + name, (R) => render(nodes, {
+      vars: { site: consts.SITE, tags: consts.TAGS, recent: consts.RECENT, ...R }, parent: null,
+    }, 0));
+  }
+  return out;
+}
+
+function compileTemplatesFast(templates, needs, consts) {
+  let budget = 100000;
   const decls = [];
   const fns = [];
   const shared = new Map();
@@ -772,7 +830,12 @@ function compileTemplates(templates, needs, consts) {
     return `if(c${id}===undefined){let o='';${r.code}c${id}=F(o);}o+=c${id};`;
   }
 
-  function genList(nodes, frames, depth, kind) {
+  function genList(nodes, frames, depth, kind, nesting = 0) {
+    // V8 may defer compiling a generated unit until its first call, beyond the catch above. Keep its lexical
+    // nesting shallow enough that lazy compilation cannot overflow before an outer false branch is checked.
+    if (nesting > 64) throw new TemplateCompileLimit();
+    budget -= nodes.length + frames.length;
+    if (budget < 0) throw new TemplateCompileLimit();
     let code = '';
     let deps = EMPTY;
     let uk = false;
@@ -791,8 +854,8 @@ function compileTemplates(templates, needs, consts) {
         }
         case 'if': {
           const r = expr(n.path, frames, kind);
-          const a = genList(n.then, frames, depth, kind);
-          const b = n.else === null ? null : genList(n.else, frames, depth, kind);
+          const a = genList(n.then, frames, depth, kind, nesting + 1);
+          const b = n.else === null ? null : genList(n.else, frames, depth, kind, nesting + 1);
           let d = union(r.deps, a.deps);
           if (b !== null) d = union(d, b.deps);
           const u = r.uk || a.uk || (b !== null && b.uk);
@@ -809,7 +872,7 @@ function compileTemplates(templates, needs, consts) {
           // cached across iterations; the mark is dropped once the loop closes.
           const fd = union(r.deps, new Set(['F' + j]));
           const inner = frames.concat([{ name: n.name, ed: fd, md: fd }]);
-          const body = genList(n.body, inner, depth, kind);
+          const body = genList(n.body, inner, depth, kind, nesting + 1);
           let bd = body.deps;
           if (bd.has('F' + j)) {
             bd = new Set(bd);
