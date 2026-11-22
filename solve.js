@@ -2,6 +2,13 @@
 // run(input) returns, byte for byte, what makefun-site 1.0.0 returns. Every cache lives inside one run() call;
 // the module-level values below are immutable constants only.
 
+import { setFlagsFromString } from 'node:v8';
+
+// V8 tuning (main.ts: "an entry may tune V8's flags too"). A build runs once per case in a short-lived process on
+// one CPU, where TurboFan's compiles of the big Markdown functions cost more than they ever win back; Maglev's code is
+// ready far sooner and fast enough. Set before any of this module's functions run.
+setFlagsFromString('--max-opt=2');
+
 // ------------------------------------------------------------------ immutable tables
 
 /** Char codes a backslash escapes in inline Markdown: \ ` * _ [ ] ( ) # + - . ! > */
@@ -34,7 +41,15 @@ const WS = /\s/;
 
 // Global regexes below are only ever used with lastIndex set right before each use (no state survives a call).
 const ESC_RE = /[&<>"']/g;
+const ESC_TEST = /[&<>"']/;
 const WORD_RE = /\S+/g;
+const WORDS16_RE = /\S+(?:\s+\S+){15}/g;
+/** A newline before a line that may end a paragraph (blank, fence, heading or thematic break), or before the end. */
+const PARA_END_RE = /\n(?=[ \t\n`#*-]|$)/g;
+/** A line of a paragraph that opens or ends on a space or tab (so needs trimming). */
+const NEEDS_TRIM_RE = /(?:^|\n)[ \t]|[ \t](?:\n|$)/;
+/** A closing fence line, from the newline before it. */
+const FENCE_CLOSE_NL_RE = /\n```[ \t]*(?=\n|$)/g;
 const SPECIAL_RE = /[\\`*[]/g;
 const STAR_RE = /[\\*]/g;
 const BRACKET_RE = /[\\\]]/g;
@@ -65,19 +80,11 @@ const hasOwn = Object.hasOwn;
 
 // ------------------------------------------------------------------ text
 
-/** HTML escape (regex-driven, native scanning); the string itself when nothing needs escaping. */
+const escOne = (c) => (c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : '&#39;');
+
+/** HTML escape: native scan; the string itself when nothing needs escaping, else one flat result. */
 function esc(s) {
-  ESC_RE.lastIndex = 0;
-  if (!ESC_RE.test(s)) return s;
-  let out = '';
-  let last = 0;
-  do {
-    const i = ESC_RE.lastIndex - 1;
-    const c = s.charCodeAt(i);
-    out += s.slice(last, i) + (c === 38 ? '&amp;' : c === 60 ? '&lt;' : c === 62 ? '&gt;' : c === 34 ? '&quot;' : '&#39;');
-    last = i + 1;
-  } while (ESC_RE.test(s));
-  return out + s.slice(last);
+  return ESC_TEST.test(s) ? s.replace(ESC_RE, escOne) : s;
 }
 
 const unescOne = (m) => (m === '&amp;' ? '&' : m === '&lt;' ? '<' : m === '&gt;' ? '>' : m === '&quot;' ? '"' : "'");
@@ -140,10 +147,20 @@ function longDate(date) {
   return `${Number(d)} ${MONTHS[Number(m) - 1]} ${y}`;
 }
 
-/** Words: runs of non-\s characters (counted natively, without allocating the matches). */
+/**
+ * Words: runs of non-\s characters, counted natively 16 at a time. A match of WORDS16_RE can only start at a word's
+ * start (were 16 words to follow some later start, they would follow this one too) and spans exactly 16 words, so
+ * the matches tile the words from the left; the fewer than 16 left are counted one by one.
+ */
 function countWords(s) {
-  WORD_RE.lastIndex = 0;
   let w = 0;
+  let pos = 0;
+  WORDS16_RE.lastIndex = 0;
+  while (WORDS16_RE.test(s)) {
+    w += 16;
+    pos = WORDS16_RE.lastIndex;
+  }
+  WORD_RE.lastIndex = pos;
   while (WORD_RE.test(s)) w++;
   return w;
 }
@@ -418,9 +435,7 @@ function inline(s, link) {
     const m = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
     const target = m === -1 ? '' : s.slice(k + 2, m);
     if (target !== '' && !WS.test(target)) {
-      const raw = unesc(target);
-      const href = link(raw);
-      out += s.slice(start, i) + '<a href="' + (href === raw ? target : esc(href)) + '">' + inline(s.slice(i + 1, k), link) + '</a>';
+      out += s.slice(start, i) + '<a href="' + link(target) + '">' + inline(s.slice(i + 1, k), link) + '</a>';
       i = m + 1;
       start = i;
       continue;
@@ -457,23 +472,17 @@ function renderMarkdown(src, link, slugify) {
       const fence = FENCE_OPEN.exec(src.slice(ls, le));
       if (fence !== null) {
         const codeStart = le + 1;
-        let p = codeStart;
         let body;
-        while (true) {
-          if (p > len) {
-            body = codeStart > len ? '' : src.slice(codeStart) + '\n';
-            break;
-          }
-          let e = src.indexOf('\n', p);
-          if (e === -1) e = len;
-          if (src.charCodeAt(p) === 96 && FENCE_CLOSE.test(src.slice(p, e))) {
-            body = src.slice(codeStart, p);
-            p = e + 1;
-            break;
-          }
-          p = e + 1;
+        FENCE_CLOSE_NL_RE.lastIndex = le;
+        if (le < len && FENCE_CLOSE_NL_RE.test(src)) {
+          const closeEnd = FENCE_CLOSE_NL_RE.lastIndex;
+          const closeStart = src.lastIndexOf('\n', closeEnd - 1) + 1;
+          body = src.slice(codeStart, closeStart);
+          ls = closeEnd + 1;
+        } else {
+          body = codeStart > len ? '' : src.slice(codeStart) + '\n';
+          ls = len + 1;
         }
-        ls = p;
         const lang = fence[1];
         html += (lang === '' ? '<pre><code>' : '<pre><code class="language-' + lang + '">') + body + '</code></pre>\n';
         continue;
@@ -544,25 +553,27 @@ function renderMarkdown(src, link, slugify) {
       html += (isOrdered && start !== 1 ? '<ol start="' + start + '">\n' : '<' + tag + '>\n') + items + '</' + tag + '>\n';
       continue;
     }
-    // A paragraph: this line and the next ones up to one that ends it. When no line needs trimming, its text is
-    // one slice of src.
+    // A paragraph: this line and the next ones up to one that ends it. Only lines opening on one of [ \t\n`#*-] (or
+    // the empty end) can end it, so the regex jumps between those candidates. When no line needs trimming, the
+    // paragraph's text is one slice of src.
     const pStart = ls;
-    let pEnd = le;
-    let lastC = src.charCodeAt(le - 1);
-    let simple = c !== 32 && c !== 9 && lastC !== 32 && lastC !== 9;
-    ls = le + 1;
-    while (ls <= len) {
-      let e = src.indexOf('\n', ls);
+    let pEnd = len;
+    let p = le;
+    while (p < len) {
+      PARA_END_RE.lastIndex = p;
+      if (!PARA_END_RE.test(src)) break;
+      const q = PARA_END_RE.lastIndex - 1;
+      let e = src.indexOf('\n', q + 1);
       if (e === -1) e = len;
-      if (endsParagraphAt(src, ls, e)) break;
-      const a = src.charCodeAt(ls);
-      lastC = src.charCodeAt(e - 1);
-      if (a === 32 || a === 9 || lastC === 32 || lastC === 9) simple = false;
-      pEnd = e;
-      ls = e + 1;
+      if (endsParagraphAt(src, q + 1, e)) {
+        pEnd = q;
+        break;
+      }
+      p = q + 1;
     }
+    ls = pEnd + 1;
     let text = src.slice(pStart, pEnd);
-    if (!simple) text = text.split('\n').map(trimLine).join('\n');
+    if (NEEDS_TRIM_RE.test(text)) text = text.split('\n').map(trimLine).join('\n');
     const ih = inline(text, link);
     if (excerpt === null) excerpt = ih;
     html += '<p>' + ih + '</p>\n';
@@ -926,6 +937,7 @@ export function run(input) {
     } else statics.push({ path: f.path, content: f.content });
   }
 
+  const PH = globalThis.__ph; const PT = () => { if (PH) { const u = process.cpuUsage(); PH.push((u.user + u.system) / 1000); } }; PT();
   // front matter
   const kept = [];
   for (const s of sources) {
@@ -960,6 +972,7 @@ export function run(input) {
   }
   sources = kept;
 
+  PT();
   // permalinks
   const taken = new Map();
   const bySource = new Map();
@@ -977,38 +990,62 @@ export function run(input) {
     bySource.set(s.path, s);
   }
 
+  PT();
   // markdown
   const staticPaths = new Set();
   for (const f of statics) staticPaths.add(f.path);
   const broken = new Set();
+  /** A link's escaped href from the escaped target `et` in directory `dir`, or null when it names nothing. */
+  const resolveHref = (dir, et) => {
+    const target = unesc(et);
+    const c = target.charCodeAt(0);
+    if (c === 47 || c === 35 || SCHEME.test(target)) return et;
+    const hash = target.indexOf('#');
+    const rel = hash === -1 ? target : target.slice(0, hash);
+    const frag = hash === -1 ? '' : target.slice(hash);
+    const path = rel === '' ? null : resolvePath(dir, rel);
+    if (path !== null) {
+      const t = bySource.get(path);
+      if (t !== undefined) return esc(`${t.url}${frag}`);
+      if (staticPaths.has(path)) return esc(`${base}/${path}${frag}`);
+    }
+    return null;
+  };
+  // Hrefs depend on the directory and the target only: resolved once per pair in this run.
+  const hrefsByDir = new Map();
   for (const s of sources) {
     const dir = dirOf(s.path);
-    const link = (target) => {
-      const c = target.charCodeAt(0);
-      if (c === 47 || c === 35 || SCHEME.test(target)) return target;
-      const hash = target.indexOf('#');
-      const rel = hash === -1 ? target : target.slice(0, hash);
-      const frag = hash === -1 ? '' : target.slice(hash);
-      const path = rel === '' ? null : resolvePath(dir, rel);
-      if (path !== null) {
-        const t = bySource.get(path);
-        if (t !== undefined) return `${t.url}${frag}`;
-        if (staticPaths.has(path)) return `${base}/${path}${frag}`;
+    let hrefs = hrefsByDir.get(dir);
+    if (hrefs === undefined) {
+      hrefs = new Map();
+      hrefsByDir.set(dir, hrefs);
+    }
+    const link = (et) => {
+      let h = hrefs.get(et);
+      if (h === undefined) {
+        h = resolveHref(dir, et);
+        hrefs.set(et, h);
       }
-      broken.add(`broken-link ${s.path} -> ${target}`);
-      return target;
+      if (h === null) {
+        broken.add(`broken-link ${s.path} -> ${unesc(et)}`);
+        return et;
+      }
+      return h;
     };
     const body = s.text.slice(s.start);
-    const md = renderMarkdown(esc(body), link, slugify);
+    const AB = globalThis.__ab ?? '';
+    const eb = AB.includes('noesc') ? body : esc(body);
+    const md = AB.includes('nomd') ? { html: '', toc: [], excerpt: '' } : renderMarkdown(eb, link, slugify);
     s.html = flat(md.html);
     s.toc = md.toc;
     s.excerpt = flat(md.excerpt);
     s.date = s.data.date ?? '';
     s.dateLong = s.data.date === undefined ? '' : longDate(s.data.date);
-    s.minutes = Math.max(1, Math.ceil(countWords(body) / 200));
+    s.minutes = AB.includes('nowc') ? 1 : Math.max(1, Math.ceil(countWords(body) / 200));
     s.text = null;
   }
 
+  PT();
   // collections
   const posts = sources.filter((s) => s.post);
   posts.sort((x, y) => byCodeUnits(y.data.date, x.data.date) || byCodeUnits(x.slug, y.slug));
@@ -1057,6 +1094,7 @@ export function run(input) {
   }
   const tagList = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
+  PT();
   // layouts
   const cardOf = (s) => ({
     title: s.data.title,
@@ -1086,6 +1124,7 @@ export function run(input) {
     return f === undefined ? null : f(R);
   };
 
+  PT();
   const output = {};
   for (const s of sources) {
     const page = cardOf(s);
@@ -1111,6 +1150,7 @@ export function run(input) {
     const html = render('tag', 'tag', { tag: { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => cards.get(p)) } });
     if (html !== null) output[`tags/${t.slug}/index.html`] = html;
   }
+  PT();
   const tagsHtml = render('tags', 'tags', {});
   if (tagsHtml !== null) output['tags/index.html'] = tagsHtml;
   for (const f of statics) {
@@ -1121,5 +1161,6 @@ export function run(input) {
   const lines = [...report, ...broken].sort(byCodeUnits);
   lines.push(`built ${sources.length - posts.length} pages, ${posts.length} posts, ${tagList.length} tags and ${statics.length} static files`);
   output['build-report.txt'] = `${lines.join('\n')}\n`;
+  PT();
   return output;
 }
